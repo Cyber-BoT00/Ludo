@@ -1,10 +1,13 @@
 export type LudoColor = 'red' | 'green' | 'yellow' | 'blue';
 
+export type GameMode = 'online' | 'bot' | 'pass_and_play';
+
 export interface PlayerSlot {
   user_id: string;
   username: string;
   color: LudoColor;
   ready: boolean;
+  is_bot?: boolean;
 }
 
 export type BoardState = Record<LudoColor, [number, number, number, number]>;
