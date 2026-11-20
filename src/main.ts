@@ -1,16 +1,24 @@
 import { supabase } from './supabase';
 import { LudoBoard3D } from './board3d';
 import { COLORS } from './ludoRules';
-import type { LudoColor, MatchRow, PlayerSlot, ProfileRow } from './types';
+import type { BoardState, LudoColor, MatchRow, PlayerSlot, ProfileRow } from './types';
 import './styles.css';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
+
+const INITIAL_BOARD_STATE: BoardState = {
+  red: [-1, -1, -1, -1],
+  green: [-1, -1, -1, -1],
+  yellow: [-1, -1, -1, -1],
+  blue: [-1, -1, -1, -1],
+};
 
 let currentUserId: string | null = null;
 let currentProfile: ProfileRow | null = null;
 let currentMatch: MatchRow | null = null;
 let board3d: LudoBoard3D | null = null;
 let matchChannel: ReturnType<typeof supabase.channel> | null = null;
+let lastBoardContainer: HTMLElement | null = null;
 
 function generateRoomCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -27,7 +35,7 @@ async function loadProfile(userId: string) {
     .select('*')
     .eq('id', userId)
     .single();
-  currentProfile = data as ProfileRow | null;
+  currentProfile = (data as ProfileRow | null) ?? null;
 }
 
 async function subscribeToMatch(matchId: string) {
@@ -41,8 +49,11 @@ async function subscribeToMatch(matchId: string) {
     .on(
       'postgres_changes',
       { event: 'UPDATE', schema: 'public', table: 'matches', filter: `id=eq.${matchId}` },
-      (payload) => {
+      async (payload) => {
         currentMatch = payload.new as MatchRow;
+        if (currentUserId && currentMatch.status === 'finished') {
+          await loadProfile(currentUserId);
+        }
         render();
       }
     )
@@ -50,11 +61,16 @@ async function subscribeToMatch(matchId: string) {
 }
 
 async function createRoom() {
-  if (!currentUserId || !currentProfile) return;
+  if (!currentUserId) return;
+
+  if (!currentProfile) {
+    await loadProfile(currentUserId);
+  }
+
   const starter: PlayerSlot[] = [
     {
       user_id: currentUserId,
-      username: currentProfile.username,
+      username: currentProfile?.username ?? 'Player',
       color: 'red',
       ready: true,
     },
@@ -67,6 +83,10 @@ async function createRoom() {
       status: 'waiting',
       max_players: 4,
       players: starter,
+      board_state: INITIAL_BOARD_STATE,
+      current_turn_index: 0,
+      last_dice_roll: null,
+      can_move: false,
     })
     .select()
     .single();
@@ -82,8 +102,18 @@ async function createRoom() {
 }
 
 async function joinRoom(code: string) {
-  if (!currentUserId || !currentProfile) return;
+  if (!currentUserId) return;
+
+  if (!currentProfile) {
+    await loadProfile(currentUserId);
+  }
+
   const cleanCode = code.trim().toUpperCase();
+  if (!cleanCode) {
+    alert('Please enter a 6-character room code');
+    return;
+  }
+
   const { data: match, error } = await supabase
     .from('matches')
     .select('*')
@@ -97,7 +127,7 @@ async function joinRoom(code: string) {
 
   const m = match as MatchRow;
   const alreadyIn = m.players.some((p) => p.user_id === currentUserId);
-  let nextPlayers = [...m.players];
+  const nextPlayers = [...m.players];
 
   if (!alreadyIn) {
     if (nextPlayers.length >= m.max_players || m.status !== 'waiting') {
@@ -108,7 +138,7 @@ async function joinRoom(code: string) {
     const freeColor: LudoColor = COLORS.find((c) => !usedColors.has(c)) || 'blue';
     nextPlayers.push({
       user_id: currentUserId,
-      username: currentProfile.username,
+      username: currentProfile?.username ?? 'Player',
       color: freeColor,
       ready: true,
     });
@@ -116,7 +146,10 @@ async function joinRoom(code: string) {
 
   const { data: updated, error: updErr } = await supabase
     .from('matches')
-    .update({ players: nextPlayers, updated_at: new Date().toISOString() })
+    .update({
+      players: nextPlayers,
+      updated_at: new Date().toISOString(),
+    })
     .eq('id', m.id)
     .select()
     .single();
@@ -132,8 +165,9 @@ async function joinRoom(code: string) {
 }
 
 async function startMatch() {
-  if (!currentMatch || currentMatch.players.length < 2) {
-    alert('Need at least 2 players to start');
+  if (!currentMatch) return;
+  if (currentMatch.players.length < 2) {
+    alert('Need at least 2 players in the room to start');
     return;
   }
 
@@ -141,16 +175,23 @@ async function startMatch() {
     .from('matches')
     .update({
       status: 'active',
+      board_state: INITIAL_BOARD_STATE,
       current_turn_index: 0,
       last_dice_roll: null,
       can_move: false,
+      winner_id: null,
       updated_at: new Date().toISOString(),
     })
     .eq('id', currentMatch.id)
     .select()
     .single();
 
-  if (!error && data) {
+  if (error) {
+    alert(error.message);
+    return;
+  }
+
+  if (data) {
     currentMatch = data as MatchRow;
     render();
   }
@@ -183,19 +224,27 @@ async function handlePawnClick(color: LudoColor, pawnIndex: number) {
     alert(error.message);
     return;
   }
+
   if (data) {
     currentMatch = data as MatchRow;
-    await loadProfile(currentUserId!);
+    if (currentUserId) {
+      await loadProfile(currentUserId);
+    }
     render();
   }
 }
 
+function destroyBoard() {
+  if (board3d) {
+    board3d.dispose();
+    board3d = null;
+  }
+  lastBoardContainer = null;
+}
+
 function render() {
   if (!currentUserId) {
-    if (board3d) {
-      board3d.dispose();
-      board3d = null;
-    }
+    destroyBoard();
     app.innerHTML = `
       <div class="card auth-card">
         <h1>Online 3D Ludo</h1>
@@ -211,16 +260,16 @@ function render() {
     `;
 
     document.getElementById('login-btn')!.onclick = async () => {
-      const email = (document.getElementById('email') as HTMLInputElement).value;
+      const email = (document.getElementById('email') as HTMLInputElement).value.trim();
       const password = (document.getElementById('password') as HTMLInputElement).value;
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) alert(error.message);
     };
 
     document.getElementById('signup-btn')!.onclick = async () => {
-      const email = (document.getElementById('email') as HTMLInputElement).value;
+      const email = (document.getElementById('email') as HTMLInputElement).value.trim();
       const password = (document.getElementById('password') as HTMLInputElement).value;
-      const username = (document.getElementById('username') as HTMLInputElement).value;
+      const username = (document.getElementById('username') as HTMLInputElement).value.trim();
       const { error } = await supabase.auth.signUp({
         email,
         password,
@@ -233,10 +282,7 @@ function render() {
   }
 
   if (!currentMatch) {
-    if (board3d) {
-      board3d.dispose();
-      board3d = null;
-    }
+    destroyBoard();
     app.innerHTML = `
       <div class="topbar">
         <div>
@@ -324,7 +370,9 @@ function render() {
       matchChannel = null;
     }
     currentMatch = null;
-    await loadProfile(currentUserId!);
+    if (currentUserId) {
+      await loadProfile(currentUserId);
+    }
     render();
   };
 
@@ -332,9 +380,10 @@ function render() {
   document.getElementById('roll-btn')?.addEventListener('click', handleRollDice);
 
   const container = document.getElementById('board-container')!;
-  if (!board3d || board3d['renderer'].domElement.parentElement !== container) {
-    board3d?.dispose();
+  if (!board3d || lastBoardContainer !== container) {
+    destroyBoard();
     board3d = new LudoBoard3D(container, handlePawnClick);
+    lastBoardContainer = container;
   }
 
   board3d.syncState(
