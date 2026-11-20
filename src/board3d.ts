@@ -1,173 +1,190 @@
-import * as THREE from 'three';
 import type { BoardState, LudoColor } from './types';
-import { COLORS, getPawnWorldXZ, isPawnMovable } from './ludoRules';
+import {
+  COLORS,
+  getPawnGridRC,
+  HOME_STRETCH_CELLS,
+  isPawnMovable,
+  OUTER_TRACK_15X15,
+  SAFE_TILE_INDICES,
+  START_OFFSET,
+} from './ludoRules';
 
-const COLOR_HEX: Record<LudoColor, number> = {
-  red: 0xe11d48,
-  green: 0x16a34a,
-  yellow: 0xeab308,
-  blue: 0x2563eb,
+const COLOR_STYLES: Record<
+  LudoColor,
+  { main: string; light: string; dark: string; label: string }
+> = {
+  red: { main: '#ef4444', light: '#fee2e2', dark: '#991b1b', label: 'R' },
+  green: { main: '#22c55e', light: '#dcfce7', dark: '#166534', label: 'G' },
+  yellow: { main: '#eab308', light: '#fef9c3', dark: '#854d0e', label: 'Y' },
+  blue: { main: '#3b82f6', light: '#dbeafe', dark: '#1e40af', label: 'B' },
 };
 
-export class LudoBoard3D {
-  private scene: THREE.Scene;
-  private camera: THREE.PerspectiveCamera;
-  private renderer: THREE.WebGLRenderer;
-  private raycaster = new THREE.Raycaster();
-  private pointer = new THREE.Vector2();
-  private pawnMeshes: THREE.Mesh[] = [];
-  private diceMesh: THREE.Mesh;
-  private onPawnClick: (color: LudoColor, pawnIndex: number) => void;
-  private animId = 0;
+export function renderLudoBoard2D(
+  container: HTMLElement,
+  board: BoardState,
+  activeColor: LudoColor | null,
+  isMyTurn: boolean,
+  diceRoll: number | null,
+  canMove: boolean,
+  onPawnClick: (color: LudoColor, pawnIndex: number) => void
+) {
+  const outerSet = new Map<string, number>();
+  OUTER_TRACK_15X15.forEach(([r, c], idx) => {
+    outerSet.set(`${r},${c}`, idx);
+  });
 
-  constructor(
-    container: HTMLElement,
-    onPawnClick: (color: LudoColor, pawnIndex: number) => void
-  ) {
-    this.onPawnClick = onPawnClick;
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x0f172a);
+  const stretchSet = new Map<string, LudoColor>();
+  for (const col of COLORS) {
+    HOME_STRETCH_CELLS[col].forEach(([r, c]) => {
+      stretchSet.set(`${r},${c}`, col);
+    });
+  }
 
-    const width = container.clientWidth || 720;
-    const height = container.clientHeight || 520;
+  const startTileColor = new Map<number, LudoColor>();
+  for (const col of COLORS) {
+    startTileColor.set(START_OFFSET[col], col);
+  }
 
-    this.camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 100);
-    this.camera.position.set(0, 16, 14);
-    this.camera.lookAt(0, 0, 0);
+  let cellsHtml = '';
+  for (let r = 0; r < 15; r++) {
+    for (let c = 0; c < 15; c++) {
+      // Skip 6x6 corner yards & 3x3 center home
+      const inTopLeft = r < 6 && c < 6;
+      const inTopRight = r < 6 && c > 8;
+      const inBottomRight = r > 8 && c > 8;
+      const inBottomLeft = r > 8 && c < 6;
+      const inCenter = r >= 6 && r <= 8 && c >= 6 && c <= 8;
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setSize(width, height);
-    this.renderer.shadowMap.enabled = true;
-    container.innerHTML = '';
-    container.appendChild(this.renderer.domElement);
-
-    // Lighting
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.75));
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.1);
-    dirLight.position.set(8, 18, 10);
-    dirLight.castShadow = true;
-    this.scene.add(dirLight);
-
-    // Base board
-    const board = new THREE.Mesh(
-      new THREE.BoxGeometry(16, 0.6, 16),
-      new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.6 })
-    );
-    board.position.y = -0.3;
-    board.receiveShadow = true;
-    this.scene.add(board);
-
-    // 4 Corner Yards
-    const yardPositions: [LudoColor, number, number][] = [
-      ['red', -4.5, -4.5],
-      ['green', 4.5, -4.5],
-      ['yellow', 4.5, 4.5],
-      ['blue', -4.5, 4.5],
-    ];
-    for (const [color, x, z] of yardPositions) {
-      const yard = new THREE.Mesh(
-        new THREE.BoxGeometry(5.2, 0.12, 5.2),
-        new THREE.MeshStandardMaterial({ color: COLOR_HEX[color], roughness: 0.4 })
-      );
-      yard.position.set(x, 0.04, z);
-      this.scene.add(yard);
-    }
-
-    // Center finish hub
-    const hub = new THREE.Mesh(
-      new THREE.BoxGeometry(3, 0.16, 3),
-      new THREE.MeshStandardMaterial({ color: 0x334155 })
-    );
-    hub.position.y = 0.06;
-    this.scene.add(hub);
-
-    // 3D Dice in center
-    this.diceMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(1.1, 1.1, 1.1),
-      new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.25 })
-    );
-    this.diceMesh.position.set(0, 0.7, 0);
-    this.diceMesh.castShadow = true;
-    this.scene.add(this.diceMesh);
-
-    // 16 Pawns (4 per color)
-    for (const color of COLORS) {
-      for (let i = 0; i < 4; i++) {
-        const pawn = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.32, 0.45, 1.1, 20),
-          new THREE.MeshStandardMaterial({ color: COLOR_HEX[color], roughness: 0.3 })
-        );
-        pawn.castShadow = true;
-        pawn.userData = { color, pawnIndex: i };
-        this.scene.add(pawn);
-        this.pawnMeshes.push(pawn);
+      if (inTopLeft || inTopRight || inBottomRight || inBottomLeft || inCenter) {
+        continue;
       }
-    }
 
-    this.renderer.domElement.addEventListener('click', this.handleClick);
-    window.addEventListener('resize', this.handleResize);
-    this.animate();
-  }
+      const key = `${r},${c}`;
+      const trackIdx = outerSet.get(key);
+      const stretchCol = stretchSet.get(key);
 
-  private handleClick = (e: MouseEvent) => {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    this.pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      let bg = '#ffffff';
+      let starBadge = '';
 
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObjects(this.pawnMeshes, false);
-    if (hits.length > 0) {
-      const { color, pawnIndex } = hits[0].object.userData as {
-        color: LudoColor;
-        pawnIndex: number;
-      };
-      this.onPawnClick(color, pawnIndex);
-    }
-  };
+      if (stretchCol) {
+        bg = COLOR_STYLES[stretchCol].main;
+      } else if (trackIdx !== undefined) {
+        const startCol = startTileColor.get(trackIdx);
+        if (startCol) {
+          bg = COLOR_STYLES[startCol].main;
+          starBadge = `<span class="tile-icon" title="Safe Start Tile">★</span>`;
+        } else if (SAFE_TILE_INDICES.has(trackIdx)) {
+          bg = '#fef3c7';
+          starBadge = `<span class="tile-icon safe-star" title="Safe Star Tile">★</span>`;
+        }
+      }
 
-  private handleResize = () => {
-    const parent = this.renderer.domElement.parentElement;
-    if (!parent) return;
-    const w = parent.clientWidth || 720;
-    const h = parent.clientHeight || 520;
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    this.renderer.setSize(w, h);
-  };
-
-  public syncState(
-    board: BoardState,
-    activeColor: LudoColor | null,
-    isMyTurn: boolean,
-    diceRoll: number | null,
-    canMove: boolean
-  ) {
-    if (diceRoll) {
-      this.diceMesh.rotation.set(diceRoll * 0.6, diceRoll * 0.9, 0);
-    }
-
-    for (const pawn of this.pawnMeshes) {
-      const { color, pawnIndex } = pawn.userData as { color: LudoColor; pawnIndex: number };
-      const pos = board[color][pawnIndex];
-      const [x, z] = getPawnWorldXZ(color, pawnIndex, pos);
-      pawn.position.set(x, 0.6, z);
-
-      const movable = isMyTurn && color === activeColor && isPawnMovable(pos, diceRoll, canMove);
-      const mat = pawn.material as THREE.MeshStandardMaterial;
-      mat.emissive.setHex(movable ? 0xfacc15 : 0x000000);
-      mat.emissiveIntensity = movable ? 0.55 : 0;
+      cellsHtml += `
+        <div
+          class="ludo-cell"
+          style="grid-row:${r + 1};grid-column:${c + 1};background:${bg};"
+        >
+          ${starBadge}
+        </div>
+      `;
     }
   }
 
-  private animate = () => {
-    this.animId = requestAnimationFrame(this.animate);
-    this.renderer.render(this.scene, this.camera);
-  };
+  const yardsHtml = `
+    <div class="yard yard-red">
+      <div class="yard-inner"><div class="yard-pad"></div></div>
+    </div>
+    <div class="yard yard-green">
+      <div class="yard-inner"><div class="yard-pad"></div></div>
+    </div>
+    <div class="yard yard-blue">
+      <div class="yard-inner"><div class="yard-pad"></div></div>
+    </div>
+    <div class="yard yard-yellow">
+      <div class="yard-inner"><div class="yard-pad"></div></div>
+    </div>
+    <div class="center-home">
+      <div class="center-badge">HOME</div>
+    </div>
+  `;
 
-  public dispose() {
-    cancelAnimationFrame(this.animId);
-    this.renderer.domElement.removeEventListener('click', this.handleClick);
-    window.removeEventListener('resize', this.handleResize);
-    this.renderer.dispose();
+  // Group pawns by grid position so stacked pawns offset cleanly
+  const slotCounts = new Map<string, number>();
+  const pawnEntries: {
+    color: LudoColor;
+    pawnIndex: number;
+    row: number;
+    col: number;
+    movable: boolean;
+    stackIdx: number;
+  }[] = [];
+
+  for (const color of COLORS) {
+    for (let i = 0; i < 4; i++) {
+      const pos = board[color][i];
+      const [row, col] = getPawnGridRC(color, i, pos);
+      const bucketKey = `${row.toFixed(2)},${col.toFixed(2)}`;
+      const stackIdx = slotCounts.get(bucketKey) ?? 0;
+      slotCounts.set(bucketKey, stackIdx + 1);
+
+      const movable =
+        isMyTurn && color === activeColor && isPawnMovable(pos, diceRoll, canMove);
+
+      pawnEntries.push({
+        color,
+        pawnIndex: i,
+        row,
+        col,
+        movable,
+        stackIdx,
+      });
+    }
   }
+
+  const pawnsHtml = pawnEntries
+    .map((p) => {
+      const offsetX = (p.stackIdx - 0.5) * 10;
+      const offsetY = (p.stackIdx % 2 === 0 ? -1 : 1) * 5;
+      const leftPct = ((p.col + 0.5) / 15) * 100;
+      const topPct = ((p.row + 0.5) / 15) * 100;
+      const st = COLOR_STYLES[p.color];
+
+      return `
+        <button
+          type="button"
+          class="ludo-pawn pawn-${p.color} ${p.movable ? 'movable' : ''}"
+          style="
+            left: calc(${leftPct}% + ${offsetX}px);
+            top: calc(${topPct}% + ${offsetY}px);
+            background: radial-gradient(circle at 32% 28%, #ffffff 0%, ${st.main} 35%, ${st.dark} 100%);
+          "
+          data-color="${p.color}"
+          data-pawn-index="${p.pawnIndex}"
+          title="${p.color.toUpperCase()} Pawn #${p.pawnIndex + 1}${p.movable ? ' (Click to Move!)' : ''}"
+        >
+          <span class="pawn-cap">${st.label}</span>
+        </button>
+      `;
+    })
+    .join('');
+
+  container.innerHTML = `
+    <div class="ludo-board-wrapper">
+      <div class="ludo-board-2d">
+        ${yardsHtml}
+        ${cellsHtml}
+        <div class="pawns-layer">
+          ${pawnsHtml}
+        </div>
+      </div>
+    </div>
+  `;
+
+  container.querySelectorAll<HTMLButtonElement>('.ludo-pawn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const color = btn.dataset.color as LudoColor;
+      const pawnIndex = Number(btn.dataset.pawnIndex);
+      onPawnClick(color, pawnIndex);
+    });
+  });
 }
